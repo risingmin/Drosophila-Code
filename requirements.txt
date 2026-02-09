@@ -1,0 +1,16 @@
+# Python dependencies for detectioncam.py
+
+# Core
+numpy>=1.24
+opencv-python>=4.8
+pillow>=10.0
+
+# ML (ensure torchvision version matches torch)
+torch>=2.3
+torchvision>=0.18
+
+# Arduino communication
+pyserial>=3.5
+
+# Not installable via pip:
+# amcam  # Install the AmScope/ToupTek camera SDK for macOS, which provides the `amcam` module and camera drivers.
