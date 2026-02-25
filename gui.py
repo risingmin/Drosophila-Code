@@ -476,6 +476,9 @@ class EmbryoDetectionGUI:
         self.classification_tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         class_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         
+        self.clear_class_log_btn = ttk.Button(classification_frame, text="Clear Log", command=self.clear_classification_log)
+        self.clear_class_log_btn.grid(row=1, column=0, sticky=(tk.E), pady=(5, 0))
+        
         classification_frame.columnconfigure(0, weight=1)
         classification_frame.rowconfigure(0, weight=1)
         
@@ -577,6 +580,11 @@ class EmbryoDetectionGUI:
             pass
         # Schedule next check
         self.root.after(100, self.process_log_queue)
+    
+    def clear_classification_log(self):
+        """Clear the classification log treeview"""
+        for item in self.classification_tree.get_children():
+            self.classification_tree.delete(item)
         
     def update_stats(self):
         """Update statistics display (thread-safe)"""
