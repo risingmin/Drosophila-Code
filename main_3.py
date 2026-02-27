@@ -224,6 +224,15 @@ class EmbryoDetector:
         self.min_motion_px = 15  # Minimum movement in pixels to be considered moving
         self.motion_check_frames = 3  # Check motion over this many frames
         self.candidate_history = {}  # {(approx_x, approx_y): [(frame, cx, cy), ...]} for motion tracking
+
+        # --- Zone 1 temporal tracking (reduce dust FP + duplicate detections) ---
+        self.zone1_tracks = {}  # {track_id: {'first_frame','last_frame','centroids','bbox','hits','emitted','max_displacement'}}
+        self.zone1_next_track_id = 1
+        self.zone1_track_match_px = 85
+        self.zone1_track_stale_frames = 20
+        self.zone1_min_confirm_frames = 2
+        self.zone1_min_path_px = 12
+        self.zone1_min_speed_px_per_frame = 0.8
         
         # --- Classification tracking ---
         self.classification_history = []  # List of {frame_index, label, timestamp, latency, speed}
@@ -1069,6 +1078,74 @@ class EmbryoDetector:
             return 0.0
         return float(np.mean(vals))
 
+    def _cleanup_zone1_tracks(self, current_frame):
+        """Remove stale Zone 1 tracks to keep memory bounded."""
+        stale_ids = [
+            tid for tid, tr in self.zone1_tracks.items()
+            if (current_frame - tr["last_frame"]) > self.zone1_track_stale_frames
+        ]
+        for tid in stale_ids:
+            del self.zone1_tracks[tid]
+
+    def _update_zone1_track(self, centroid, bbox, current_frame):
+        """Match a candidate to an existing track or create a new one."""
+        cx, cy = centroid
+        matched_id = None
+        best_dist = float("inf")
+
+        for tid, tr in self.zone1_tracks.items():
+            if (current_frame - tr["last_frame"]) > self.zone1_track_stale_frames:
+                continue
+            tcx, tcy = tr["centroids"][-1]
+            dist = ((cx - tcx) ** 2 + (cy - tcy) ** 2) ** 0.5
+            if dist < self.zone1_track_match_px and dist < best_dist:
+                matched_id = tid
+                best_dist = dist
+
+        if matched_id is None:
+            track_id = self.zone1_next_track_id
+            self.zone1_next_track_id += 1
+            self.zone1_tracks[track_id] = {
+                "first_frame": current_frame,
+                "last_frame": current_frame,
+                "centroids": [centroid],
+                "bbox": bbox,
+                "hits": 1,
+                "emitted": False,
+                "max_displacement": 0.0,
+            }
+            return track_id, self.zone1_tracks[track_id]
+
+        tr = self.zone1_tracks[matched_id]
+        tr["last_frame"] = current_frame
+        tr["bbox"] = bbox
+        tr["hits"] += 1
+        tr["centroids"].append(centroid)
+        if len(tr["centroids"]) > 12:
+            tr["centroids"] = tr["centroids"][-12:]
+
+        fx, fy = tr["centroids"][0]
+        tr["max_displacement"] = max(
+            float(tr.get("max_displacement", 0.0)),
+            ((cx - fx) ** 2 + (cy - fy) ** 2) ** 0.5,
+        )
+        return matched_id, tr
+
+    def _should_emit_zone1_track(self, tr):
+        """Decide if a track is reliable enough to send to ML exactly once."""
+        if tr["emitted"]:
+            return False
+        if tr["hits"] < self.zone1_min_confirm_frames:
+            return False
+        if tr["max_displacement"] < self.zone1_min_path_px:
+            return False
+
+        frame_span = max(1, tr["last_frame"] - tr["first_frame"])
+        avg_speed = tr["max_displacement"] / frame_span
+        if avg_speed < self.zone1_min_speed_px_per_frame:
+            return False
+        return True
+
 
 
     # --------------------- callback (detection) --------------------
@@ -1474,6 +1551,8 @@ class EmbryoDetector:
                 "in_edge_band": in_edge_band
             })
 
+        self._cleanup_zone1_tracks(fc)
+
         if not candidates:
             if self.frame_count % 60 == 0:  # Log when no candidates found
                 print(f"  Frame {self.frame_count}: No candidates after filtering")
@@ -1489,64 +1568,16 @@ class EmbryoDetector:
         # No sorting - process candidates in order found (TRIPWIRE PRIORITY DISABLED)
         # candidates.sort(key=lambda c: c["edge_priority"])  # COMMENTED OUT - was sorting by tripwire distance
 
-        # Accept all candidates with only same-frame deduplication + per-frame cap
+        # Accept candidates only after short temporal confirmation:
+        # this suppresses static dust and prevents re-detecting one embryo every frame.
         accepts = []
         for cand in candidates:
             if len(accepts) >= self.MAX_ACCEPTS_PER_FRAME:
                 break
             cx, cy = cand["centroid"]
             bbox = cand["bbox"]
-
-            # === MOTION CHECK: Filter out stationary objects (dust) ===
-            # Track this candidate's position and check if it moved
-            grid_key = (cx // 50, cy // 50)  # Grid cell for approximate matching
-            
-            # Find matching candidate from recent history
-            is_moving = False
-            matched_key = None
-            
-            for hist_key, positions in list(self.candidate_history.items()):
-                if not positions:
-                    continue
-                # Check if this candidate is close to a recent position
-                last_frame, last_cx, last_cy = positions[-1]
-                dist = ((cx - last_cx)**2 + (cy - last_cy)**2)**0.5
-                
-                # If close enough, this is the same object
-                if dist < 100:  # Max matching distance
-                    matched_key = hist_key
-                    # Check motion over recent frames
-                    if len(positions) >= 2:
-                        first_frame, first_cx, first_cy = positions[0]
-                        total_dist = ((cx - first_cx)**2 + (cy - first_cy)**2)**0.5
-                        frame_span = fc - first_frame
-                        
-                        # Object must have moved min_motion_px over motion_check_frames
-                        if total_dist >= self.min_motion_px and frame_span <= self.motion_check_frames * 2:
-                            is_moving = True
-                    break
-            
-            # Update candidate history
-            if matched_key is not None:
-                self.candidate_history[matched_key].append((fc, cx, cy))
-                # Keep only recent positions
-                if len(self.candidate_history[matched_key]) > 10:
-                    self.candidate_history[matched_key] = self.candidate_history[matched_key][-10:]
-            else:
-                # New candidate - track it
-                self.candidate_history[grid_key] = [(fc, cx, cy)]
-            
-            # Clean up stale history entries (older than 30 frames)
-            stale_keys = [k for k, v in self.candidate_history.items() 
-                         if v and (fc - v[-1][0]) > 30]
-            for k in stale_keys:
-                del self.candidate_history[k]
-            
-            # Skip if not moving (likely dust)
-            if not is_moving and matched_key is not None:
-                # Object was tracked but not moving - skip it
-                if fc % 60 == 0:
-                    print(f"  Filtered stationary object at ({cx}, {cy}) - likely dust")
+            track_id, track = self._update_zone1_track((cx, cy), bbox, fc)
+            if not self._should_emit_zone1_track(track):
                 continue
 
             # Same-frame dedup only (to avoid immediate duplicates within the same frame)
@@ -1564,7 +1595,9 @@ class EmbryoDetector:
             if duplicate:
                 continue
 
+            cand["track_id"] = track_id
             accepts.append(cand)
+            track["emitted"] = True
 
         if not accepts:
             if self.frame_count % 60 == 0:  # Log when no accepts
