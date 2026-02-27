@@ -225,14 +225,15 @@ class EmbryoDetector:
         self.motion_check_frames = 3  # Check motion over this many frames
         self.candidate_history = {}  # {(approx_x, approx_y): [(frame, cx, cy), ...]} for motion tracking
 
-        # --- Zone 1 temporal tracking (reduce dust FP + duplicate detections) ---
+        # --- Zone 1 temporal tracking (prevent duplicate detections of the same embryo) ---
         self.zone1_tracks = {}  # {track_id: {'first_frame','last_frame','centroids','bbox','hits','emitted','max_displacement'}}
         self.zone1_next_track_id = 1
-        self.zone1_track_match_px = 85
-        self.zone1_track_stale_frames = 20
-        self.zone1_min_confirm_frames = 2
-        self.zone1_min_path_px = 12
-        self.zone1_min_speed_px_per_frame = 0.8
+        self.zone1_track_match_px = 100       # generous matching radius for fast embryos
+        self.zone1_track_stale_frames = 25    # how many frames before a lost track is purged
+        # Stationarity suppression: objects sitting still for this many consecutive
+        # frames are considered dust and silenced (but first sighting always emits).
+        self.zone1_dust_still_frames = 8      # must be motionless for this many hits
+        self.zone1_dust_still_px = 5          # movement below this is "still"
         
         # --- Classification tracking ---
         self.classification_history = []  # List of {frame_index, label, timestamp, latency, speed}
@@ -1132,18 +1133,23 @@ class EmbryoDetector:
         return matched_id, tr
 
     def _should_emit_zone1_track(self, tr):
-        """Decide if a track is reliable enough to send to ML exactly once."""
+        """Decide whether to send this detection to ML.
+
+        Strategy:
+          • Each track is emitted **exactly once** (``emitted`` flag).
+          • First sighting → always emit (so fast-moving embryos are never missed).
+          • If the same object has been sitting perfectly still for many frames
+            (``zone1_dust_still_frames``), treat it as dust and suppress.
+        """
         if tr["emitted"]:
             return False
-        if tr["hits"] < self.zone1_min_confirm_frames:
-            return False
-        if tr["max_displacement"] < self.zone1_min_path_px:
-            return False
 
-        frame_span = max(1, tr["last_frame"] - tr["first_frame"])
-        avg_speed = tr["max_displacement"] / frame_span
-        if avg_speed < self.zone1_min_speed_px_per_frame:
-            return False
+        # Dust gate: if we've accumulated many hits with negligible motion, skip.
+        if tr["hits"] >= self.zone1_dust_still_frames:
+            if tr["max_displacement"] < self.zone1_dust_still_px:
+                return False
+
+        # First (or early) sighting – emit immediately so real embryos aren't missed.
         return True
 
 
