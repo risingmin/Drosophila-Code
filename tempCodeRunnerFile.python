@@ -1,7 +1,0 @@
-import sys
-
-data = sys.stdin.readlines()
-num_tests = int(data[0])
-
-for x in range(1, len(data)):
-    num_lines = 
