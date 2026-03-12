@@ -42,7 +42,7 @@ class EmbryoDetectionGUI:
         
         # Camera exposure and gain controls (for display adjustment)
         self.display_brightness = 1.0  # Legacy display brightness
-        self.exposure_time_us = 2000
+        self.exposure_time_us = 9
         self.gain = 5000  # Default to 5000 (50x), will be updated from detector
         
         # Debouncing for automatic camera settings updates
@@ -262,9 +262,23 @@ class EmbryoDetectionGUI:
                                                 foreground="gray")
         self.detection_status_label.grid(row=4, column=0, pady=2)
         
+        # Capture Zone 2 Reference button — right below Start Detection
+        self.capture_zone2_ref_btn = ttk.Button(
+            control_frame, text="📷 Capture Zone 2 Reference",
+            command=self.capture_zone2_reference, width=25
+        )
+        self.capture_zone2_ref_btn.grid(row=5, column=0, pady=5)
+        
+        # Zone 2 reference status
+        self.zone2_ref_status_label = ttk.Label(
+            control_frame, text="⚠ Reference NOT captured",
+            foreground="red"
+        )
+        self.zone2_ref_status_label.grid(row=6, column=0, pady=2)
+        
         # Flip options
         flip_frame = ttk.LabelFrame(control_frame, text="Display Options", padding="10")
-        flip_frame.grid(row=5, column=0, sticky=(tk.W, tk.E), pady=5)
+        flip_frame.grid(row=7, column=0, sticky=(tk.W, tk.E), pady=5)
         
         self.flip_horizontal_var = tk.BooleanVar(value=False)
         self.flip_horizontal_cb = ttk.Checkbutton(flip_frame, text="Flip Horizontal", 
@@ -280,11 +294,11 @@ class EmbryoDetectionGUI:
         
         # Exposure Time slider (in milliseconds for user convenience)
         ttk.Label(flip_frame, text="Exposure (ms):").grid(row=2, column=0, sticky=tk.W, pady=2)
-        self.exposure_var = tk.DoubleVar(value=2.000)  # Default 264 μs = 0.264 ms
+        self.exposure_var = tk.DoubleVar(value=0.009)  # Default 9 μs = 0.009 ms
         self.exposure_scale = ttk.Scale(flip_frame, from_=0.0, to=10.0, 
                                         variable=self.exposure_var, orient=tk.HORIZONTAL, length=150)
         self.exposure_scale.grid(row=2, column=1, sticky=(tk.W, tk.E), padx=5, pady=2)
-        self.exposure_label = ttk.Label(flip_frame, text="2.000")
+        self.exposure_label = ttk.Label(flip_frame, text="0.009")
         self.exposure_label.grid(row=2, column=2, padx=5, pady=2)
         self.exposure_scale.configure(command=lambda v: self.update_exposure_display(float(v)))
         
@@ -460,12 +474,14 @@ class EmbryoDetectionGUI:
         classification_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
         
         # Create treeview for classification log
-        columns = ('Frame', 'Detection', 'Label', 'Speed (px/fr)', 'Time (ms)')
+        columns = ('Frame', 'Detection', 'Label', 'Piezo', 'Speed (px/fr)', 'Time (ms)')
         self.classification_tree = ttk.Treeview(classification_frame, columns=columns, show='headings', height=10)
         for col in columns:
             self.classification_tree.heading(col, text=col)
             if col == 'Speed (px/fr)':
                 self.classification_tree.column(col, width=70)
+            elif col == 'Piezo':
+                self.classification_tree.column(col, width=40)
             else:
                 self.classification_tree.column(col, width=55)
         
@@ -629,6 +645,19 @@ class EmbryoDetectionGUI:
                     if hasattr(detector, 'zone2_trigger_count'):
                         self.zone2_triggers_label.config(text=f"⚡ Triggers: {detector.zone2_trigger_count}")
                     
+                    # Update Zone 2 reference status in real-time
+                    if hasattr(detector, 'zone2_reference_set'):
+                        if detector.zone2_reference_set:
+                            self.zone2_ref_status_label.config(
+                                text="✓ Reference captured — Zone 2 ACTIVE",
+                                foreground="green"
+                            )
+                        else:
+                            self.zone2_ref_status_label.config(
+                                text="⚠ Reference NOT captured — Zone 2 inactive",
+                                foreground="red"
+                            )
+                    
                     # Update Zone 2 info display
                     if hasattr(detector, 'zone2_width') and detector.zone2_width > 0:
                         status = "enabled" if detector.zone2_enabled else "disabled"
@@ -674,9 +703,12 @@ class EmbryoDetectionGUI:
                                 else:
                                     speed_str = "--"
                                 
+                                # Piezo trigger indicator
+                                piezo_str = "⚡" if entry.get('triggered_piezo', False) else "—"
+                                
                                 # Color code: green for Correct, red for Incorrect
                                 item_id = self.classification_tree.insert('', 'end', values=(
-                                    frame_idx, det_idx, label, speed_str, f"{inf_time:.2f}"
+                                    frame_idx, det_idx, label, piezo_str, speed_str, f"{inf_time:.2f}"
                                 ))
                                 if label == 'Correct':
                                     self.classification_tree.set(item_id, 'Label', '✓ Correct')
@@ -955,8 +987,43 @@ class EmbryoDetectionGUI:
             self.zone2_info_label.config(
                 text=f"Zone 2: x={zone2_x}, y={zone2_y}, w={zone2_width}, h={zone2_height} ({status})"
             )
+            # Reference was cleared by ROI change — remind user
+            self.zone2_ref_status_label.config(
+                text="⚠ Reference cleared — recapture needed",
+                foreground="orange"
+            )
         else:
             self.log_message("Failed to update Zone 2 settings")
+
+    def capture_zone2_reference(self):
+        """Capture the current Zone 2 frame as the static 'empty channel' reference.
+        
+        User should click this when:
+        - Setup is complete (lighting, focus, etc.)
+        - Channel is EMPTY (no embryos flowing yet)
+        - Ready to start the flow of embryos
+        """
+        with self._lock:
+            detector = self.detector
+        
+        if not detector or detector.width == 0:
+            self.log_message("Cannot capture reference: Camera/Video not running")
+            return
+        
+        success = detector.capture_zone2_reference()
+        
+        if success:
+            self.log_message("✓ Zone 2 reference captured! Zone 2 detection is now ACTIVE.")
+            self.zone2_ref_status_label.config(
+                text="✓ Reference captured — Zone 2 ACTIVE",
+                foreground="green"
+            )
+        else:
+            self.log_message("✗ Failed to capture Zone 2 reference — is camera running?")
+            self.zone2_ref_status_label.config(
+                text="✗ Capture failed — try again",
+                foreground="red"
+            )
 
     def update_roi_from_detector(self):
         """Update ROI sliders from detector's current values (both zones)"""

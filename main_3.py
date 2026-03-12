@@ -149,7 +149,7 @@ def inference_worker(model_path, crop_queue, results_queue, stop_event, device):
                 result = {
                     'frame_index': frame_indices[i],
                     'detection_index': detection_indices[i] if i < len(detection_indices) else 0,
-                    'inference_label': class_names[pred_idx],
+                    'inference_label': 'Correct',  # TEMP: force all embryos as Correct (was: class_names[pred_idx])
                     'inference_time': inference_time / len(images),  # Average time per image
                     'speed': speeds[i] if i < len(speeds) else None,
                     'object_id': obj_ids[i] if i < len(obj_ids) else None
@@ -190,7 +190,7 @@ class EmbryoDetector:
         
         # Zone 1 decision tracking: list of (timestamp, decision) for recent classifications
         self.zone1_decisions = []  # [(timestamp, 'Keep'/'Discard', object_id), ...]
-        self.zone1_decision_window_ms = 2000  # How long a Zone 1 decision is valid (ms)
+        self.zone1_decision_window_ms = 3000  # How long a Zone 1 decision is valid (ms) - extended for more sensitivity (was 2000)
         self.zone1_keep_active = False  # Quick flag: is there an active "Keep" decision?
         
         # Zone 2 ROI configuration (separate from Zone 1)
@@ -200,11 +200,13 @@ class EmbryoDetector:
         self.zone2_width = 0
         self.zone2_height = 0
         
-        # Zone 2 detection parameters (simpler than Zone 1 - just motion + size)
-        self.zone2_min_area = 800   # Lower than Zone 1 for more sensitivity (was 1500)
-        self.zone2_max_area = 250000  # Maximum contour area
-        self.zone2_var_threshold = 16  # Background subtractor sensitivity (lower = more sensitive)
-        self.zone2_bg_subtractor = None  # Separate background subtractor for Zone 2
+        # Zone 2 detection: static reference frame differencing
+        # Captures an "empty channel" frame once and diffs against it forever.
+        # Anything different from the reference = something is there.
+        self.zone2_reference_frame = None   # Grayscale reference of empty channel
+        self.zone2_reference_set = False    # Whether reference has been captured
+        self.zone2_diff_threshold = 20      # Per-pixel intensity diff to count as "different"
+        self.zone2_motion_pct_threshold = 0.3  # % of zone pixels that must differ to trigger (very low = very sensitive)
         
         # Zone 2 statistics
         self.zone2_detection_count = 0
@@ -291,7 +293,7 @@ class EmbryoDetector:
         
         # Camera exposure and gain settings (can be updated dynamically)
         # Note: Gain uses camera SDK units where 100 = 1x (baseline), 5000 = 50x
-        self.exposure_time_us = 264  # microseconds
+        self.exposure_time_us = 9  # microseconds
         self.gain = 5000  # camera-specific gain units (5000 = 50x baseline, minimum is 100)
         
         # Legacy ROI parameters (kept for backward compatibility during transition)
@@ -600,10 +602,11 @@ class EmbryoDetector:
         self.zone2_height = self.roi_height
         self.zone2_roi_start_y = self.roi_start_y
         self.zone2_roi_end_y = self.roi_end_y
-        self.zone2_bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=30, varThreshold=20, detectShadows=False
-        )
+        # Zone 2 uses static reference frame — user must click "Capture Reference" in GUI
+        self.zone2_reference_frame = None
+        self.zone2_reference_set = False
         print(f"Zone 2 (trigger) initialized: x={self.zone2_x}, y={self.zone2_y}, w={self.zone2_width}, h={self.zone2_height}")
+        print(f"[ZONE2] Waiting for user to capture reference frame (click button in GUI)")
     
         print(f"Camera opened successfully at {self.width}x{self.height}.")
         print(f"ROI: y={self.roi_start_y}..{self.roi_end_y} (h={self.roi_end_y - self.roi_start_y})")
@@ -636,10 +639,11 @@ class EmbryoDetector:
         self.zone2_height = self.roi_height
         self.zone2_roi_start_y = self.roi_start_y
         self.zone2_roi_end_y = self.roi_end_y
-        self.zone2_bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=30, varThreshold=20, detectShadows=False
-        )
+        # Zone 2 uses static reference frame — user must click "Capture Reference" in GUI
+        self.zone2_reference_frame = None
+        self.zone2_reference_set = False
         print(f"Zone 2 (trigger) initialized: x={self.zone2_x}, y={self.zone2_y}, w={self.zone2_width}, h={self.zone2_height}")
+        print(f"[ZONE2] Waiting for user to capture reference frame (click button in GUI)")
         
         print(f"Video opened successfully at {self.width}x{self.height}.")
         print(f"ROI: y={self.roi_start_y}..{self.roi_end_y} (h={self.roi_end_y - self.roi_start_y})")
@@ -794,15 +798,51 @@ class EmbryoDetector:
         self.zone2_roi_start_y = self.zone2_y
         self.zone2_roi_end_y = self.zone2_y + self.zone2_height
         
-        # Reset Zone 2 background subtractor
-        if self.is_camera_mode:
-            self.zone2_bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-                history=30, varThreshold=20, detectShadows=False
-            )
+        # Reset Zone 2 reference frame — user must re-capture after ROI change
+        self.zone2_reference_frame = None
+        self.zone2_reference_set = False
+        print(f"[ZONE2] Reference cleared — click 'Capture Zone 2 Reference' again after adjusting ROI")
         
         print(f"Zone 2 ROI updated: x={self.zone2_x}, y={self.zone2_y}, w={self.zone2_width}, h={self.zone2_height}")
         return True
     
+    def capture_zone2_reference(self):
+        """Capture the current Zone 2 frame as the static 'empty channel' reference.
+        
+        Call this when the channel is empty and lighting is set up.
+        Zone 2 will diff every future frame against this reference —
+        anything different = something is there.
+        
+        Returns True if reference was captured, False if not possible yet.
+        """
+        if self.width == 0 or self.height == 0:
+            print("[ZONE2] Cannot capture reference — camera/video not initialized")
+            return False
+        
+        if self.zone2_width <= 0 or self.zone2_height <= 0:
+            print("[ZONE2] Cannot capture reference — Zone 2 ROI not set")
+            return False
+        
+        # Get the latest frame
+        frame = getattr(self, '_last_frame', None)
+        if frame is None:
+            print("[ZONE2] Cannot capture reference — no frame available yet")
+            return False
+        
+        frame_h, frame_w = frame.shape[:2]
+        z2_x = max(0, min(self.zone2_x, frame_w - 1))
+        z2_y = max(0, min(self.zone2_y, frame_h - 1))
+        z2_w = max(1, min(self.zone2_width, frame_w - z2_x))
+        z2_h = max(1, min(self.zone2_height, frame_h - z2_y))
+        
+        zone2_frame = frame[z2_y:z2_y+z2_h, z2_x:z2_x+z2_w]
+        self.zone2_reference_frame = cv2.cvtColor(zone2_frame, cv2.COLOR_BGR2GRAY).astype('float32')
+        self.zone2_reference_set = True
+        
+        print(f"[ZONE2] ✓ Reference frame captured! ROI=({z2_x},{z2_y},{z2_w}x{z2_h})")
+        print(f"[ZONE2]   Zone 2 detection is now ACTIVE — any difference from this reference will trigger.")
+        return True
+
     def update_zone1_decision_window(self, window_ms):
         """Update the time window for Zone 1 decisions to remain valid."""
         self.zone1_decision_window_ms = max(100, int(window_ms))
@@ -854,12 +894,31 @@ class EmbryoDetector:
         
         This prevents the same 'Keep' decision from triggering multiple times
         if multiple objects pass through Zone 2.
+        Also marks the corresponding classification_history entry as having triggered the piezo.
         """
+        consumed_oid = None
         for i, (t, d, oid) in enumerate(self.zone1_decisions):
             if d == 'Keep':
+                consumed_oid = oid
                 self.zone1_decisions.pop(i)
                 print(f"[ZONE1] Consumed 'Keep' decision (object_id={oid})")
                 break
+        
+        # Mark the most recent matching classification as having triggered the piezo
+        if consumed_oid is not None:
+            # Walk backwards to find the entry with matching object_id
+            for entry in reversed(self.classification_history):
+                if entry.get('object_id') == consumed_oid and entry.get('label') == 'Correct':
+                    entry['triggered_piezo'] = True
+                    print(f"[ZONE1] Marked classification (object_id={consumed_oid}) as piezo-triggered")
+                    break
+        else:
+            # No object_id match — mark the most recent 'Correct' entry
+            for entry in reversed(self.classification_history):
+                if entry.get('label') == 'Correct' and not entry.get('triggered_piezo', False):
+                    entry['triggered_piezo'] = True
+                    print(f"[ZONE1] Marked most recent 'Correct' classification as piezo-triggered")
+                    break
         
         # Update quick flag
         self.zone1_keep_active = any(d == 'Keep' for _, d, _ in self.zone1_decisions)
@@ -986,7 +1045,8 @@ class EmbryoDetector:
             'timestamp': time.time(),
             'inference_time': inference_time,
             'speed': speed,
-            'object_id': object_id
+            'object_id': object_id,
+            'triggered_piezo': False  # Will be set True by _consume_zone1_keep if piezo fires
         }
         self.classification_history.append(classification_entry)
         
@@ -1209,6 +1269,9 @@ class EmbryoDetector:
         self.frame_count += 1
         fc = self.frame_count
         
+        # Store latest frame for on-demand reference capture (Zone 2)
+        self._last_frame = frame
+        
         # Skip detection if disabled (but still update background model for when it's re-enabled)
         if not self.detection_enabled:
             # PRE-TRAIN background models while detection is OFF
@@ -1227,28 +1290,8 @@ class EmbryoDetector:
                     self.bg_subtractor.apply(roi_pre, learningRate=0.05)
                     self.bg_subtractor_sens.apply(roi_pre, learningRate=0.08)
                 
-                # Pre-train Zone 2 background model
-                if self.zone2_enabled and self.zone2_width > 0 and self.zone2_height > 0:
-                    # Initialize Zone 2 bg subtractor if needed
-                    if self.zone2_bg_subtractor is None:
-                        self.zone2_bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-                            history=50, varThreshold=self.zone2_var_threshold, detectShadows=False
-                        )
-                    
-                    z2_x = max(0, min(self.zone2_x, frame_w - 1))
-                    z2_y = max(0, min(self.zone2_y, frame_h - 1))
-                    z2_w = max(1, min(self.zone2_width, frame_w - z2_x))
-                    z2_h = max(1, min(self.zone2_height, frame_h - z2_y))
-                    zone2_frame = frame[z2_y:z2_y+z2_h, z2_x:z2_x+z2_w]
-                    self.zone2_bg_subtractor.apply(zone2_frame, learningRate=0.1)
-                    
-                    # Track pre-training progress
-                    if not hasattr(self, '_zone2_pretrain_frames'):
-                        self._zone2_pretrain_frames = 0
-                    self._zone2_pretrain_frames += 1
-                    
-                    if self._zone2_pretrain_frames % 30 == 0:
-                        print(f"[PRETRAIN] Zone 2 background model: {self._zone2_pretrain_frames} frames processed")
+                # Zone 2 reference: no auto-capture here — user must click "Capture Reference" in GUI
+                # (reference is captured via capture_zone2_reference() method)
                 
             return  # Skip rest of detection
         
@@ -1684,6 +1727,18 @@ class EmbryoDetector:
         if len(self.performance_metrics['detection_time']) > self._metrics_max_size:
             self.performance_metrics['detection_time'] = self.performance_metrics['detection_time'][-self._metrics_max_size:]
         
+        # === DRAIN INFERENCE RESULTS BEFORE ZONE 2 ===
+        # Critical: process any pending classification results NOW so that
+        # Zone 1 "Keep" decisions are available for Zone 2 trigger checks.
+        # Without this, inference results only get processed in the main loop,
+        # which runs AFTER process_frame returns — too late for Zone 2.
+        try:
+            while True:
+                result = self.results_queue.get_nowait()
+                self._process_classification_result(result)
+        except Empty:
+            pass
+        
         # === ZONE 2 PROCESSING ===
         # Process Zone 2 (trigger zone) - uses simple motion detection
         # Arduino only triggers if Zone 1 has an active 'Keep' decision
@@ -1705,12 +1760,6 @@ class EmbryoDetector:
         if self.zone2_width <= 0 or self.zone2_height <= 0:
             return
         
-        # Ensure Zone 2 background subtractor exists
-        if self.zone2_bg_subtractor is None:
-            self.zone2_bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-                history=50, varThreshold=self.zone2_var_threshold, detectShadows=False
-            )
-        
         fc = self.frame_count
         
         # Extract Zone 2 ROI
@@ -1721,65 +1770,37 @@ class EmbryoDetector:
         z2_h = max(1, min(self.zone2_height, frame_h - z2_y))
         
         zone2_frame = frame[z2_y:z2_y+z2_h, z2_x:z2_x+z2_w]
+        zone2_gray = cv2.cvtColor(zone2_frame, cv2.COLOR_BGR2GRAY).astype('float32')
         
-        # Simple background subtraction for Zone 2 (fast, no CLAHE or LAB)
-        # Check if pre-training happened (skip warmup if so)
-        pretrain_frames = getattr(self, '_zone2_pretrain_frames', 0)
-        needs_warmup = (pretrain_frames < 15) and (self.frame_count <= 15)
+        # If reference not yet captured, skip detection (user must click "Capture Reference" in GUI)
+        if not self.zone2_reference_set:
+            if fc % 120 == 0:  # Remind periodically
+                print(f"[ZONE2] Waiting for reference frame — click 'Capture Zone 2 Reference' in GUI")
+            return
         
-        if needs_warmup:
-            # Still in warmup phase - build background model
-            fg_mask = self.zone2_bg_subtractor.apply(zone2_frame, learningRate=0.2)
-            if self.frame_count % 5 == 0:
-                print(f"[ZONE2] Warmup frame {self.frame_count}/15 (pretrain={pretrain_frames})")
-            return  # Don't trigger during warmup
-        else:
-            # Ready for detection - use normal learning rate
-            fg_mask = self.zone2_bg_subtractor.apply(zone2_frame, learningRate=0.05)
+        # Diff current frame against the static reference
+        diff = cv2.absdiff(zone2_gray, self.zone2_reference_frame)
+        _, thresh = cv2.threshold(diff.astype('uint8'), self.zone2_diff_threshold, 255, cv2.THRESH_BINARY)
         
-        # Light morphology cleanup (more aggressive dilation for better detection)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, kernel, iterations=2)  # More closing
-        fg_mask = cv2.dilate(fg_mask, kernel, iterations=3)  # More dilation (was 1)
-        
-        # Find contours
-        contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Filter by size (embryo-sized objects only)
-        zone2_detections = []
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if self.zone2_min_area <= area <= self.zone2_max_area:
-                M = cv2.moments(contour)
-                if M["m00"] > 0:
-                    cx = int(M["m10"] / M["m00"]) + z2_x  # Convert to full-frame coords
-                    cy = int(M["m01"] / M["m00"]) + z2_y
-                    zone2_detections.append({
-                        'centroid': (cx, cy),
-                        'area': area,
-                        'contour': contour
-                    })
+        # Count how much of the zone differs from the empty reference
+        diff_pixel_count = cv2.countNonZero(thresh)
+        diff_pct = diff_pixel_count / thresh.size * 100
+        something_present = diff_pct > self.zone2_motion_pct_threshold
         
         # Debug: Log Zone 2 detection stats periodically
         if fc % 60 == 0:
-            fg_pct = np.count_nonzero(fg_mask) / fg_mask.size * 100
-            print(f"[ZONE2 DEBUG] Frame {fc}: {len(contours)} contours found, "
-                  f"fg_mask={fg_pct:.1f}%, ROI=({z2_x},{z2_y},{z2_w}x{z2_h})")
-            if contours:
-                areas = [cv2.contourArea(c) for c in contours]
-                print(f"  Contour areas: {sorted([int(a) for a in areas if a > 100])}")
-                print(f"  After size filter ({self.zone2_min_area}-{self.zone2_max_area}): {len(zone2_detections)} detections")
+            print(f"[ZONE2 DEBUG] Frame {fc}: diff_pixels={diff_pixel_count}, "
+                  f"diff={diff_pct:.2f}% (threshold={self.zone2_motion_pct_threshold}%), "
+                  f"detected={'YES' if something_present else 'no'}, "
+                  f"ROI=({z2_x},{z2_y},{z2_w}x{z2_h})")
         
-        if not zone2_detections:
+        if not something_present:
             return
         
-        self.zone2_detection_count += len(zone2_detections)
+        self.zone2_detection_count += 1
         
-        # Log Zone 2 detections
-        if len(zone2_detections) > 0:
-            det_areas = [d['area'] for d in zone2_detections]
-            print(f"[ZONE2] Frame {fc}: Detected {len(zone2_detections)} objects, areas={[int(a) for a in det_areas]}")
+        # Log Zone 2 detection
+        print(f"[ZONE2] Frame {fc}: Something present in zone (diff={diff_pct:.2f}% vs reference)")
         
         # === TRIGGER DECISION ===
         # Only trigger if there's an active 'Keep' decision from Zone 1
@@ -1809,7 +1830,7 @@ class EmbryoDetector:
                 print(f"[ZONE2] Frame {fc}: Detection but in cooldown period")
         else:
             if fc % 60 == 0:  # Log periodically
-                print(f"[ZONE2] Frame {fc}: Detected {len(zone2_detections)} objects but no active 'Keep' from Zone 1")
+                print(f"[ZONE2] Frame {fc}: Motion detected but no active 'Keep' from Zone 1")
 
     # -------------------------- run loop --------------------------
     def run(self, video_path: Optional[str] = None, show_window: bool = False):
