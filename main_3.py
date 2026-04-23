@@ -8,6 +8,7 @@ import queue
 import os
 import sys
 import argparse
+from datetime import datetime
 from typing import Any, Optional
 
 # Ensure the project directory is in the Python path for amcam import
@@ -1268,6 +1269,7 @@ class EmbryoDetector:
         frame_start_time = time.time()
         self.frame_count += 1
         fc = self.frame_count
+        process_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         
         # Store latest frame for on-demand reference capture (Zone 2)
         self._last_frame = frame
@@ -1334,16 +1336,17 @@ class EmbryoDetector:
                        cv2.FONT_HERSHEY_SIMPLEX, 3, (255, 255, 255), 3)
             
             # Save the annotated first frame (async via save_queue to avoid blocking)
+            first_frame_name = f"FIRST_FRAME_WITH_ROI_{process_timestamp}.png"
             if hasattr(self, 'save_queue') and self.save_queue is not None:
                 try:
-                    self.save_queue.put_nowait(('frame', os.path.join(FRAME_OUTPUT_DIR, "FIRST_FRAME_WITH_ROI.png"), first_frame))
+                    self.save_queue.put_nowait(('frame', os.path.join(FRAME_OUTPUT_DIR, first_frame_name), first_frame))
                 except Exception:
                     # Queue full, skip to avoid blocking
                     pass
             else:
                 # Fallback: save synchronously if queue not available
-                cv2.imwrite(os.path.join(FRAME_OUTPUT_DIR, "FIRST_FRAME_WITH_ROI.png"), first_frame)
-            print(f"*** SAVED FIRST FRAME WITH ROI OVERLAY: {FRAME_OUTPUT_DIR}/FIRST_FRAME_WITH_ROI.png ***")
+                cv2.imwrite(os.path.join(FRAME_OUTPUT_DIR, first_frame_name), first_frame)
+            print(f"*** SAVED FIRST FRAME WITH ROI OVERLAY: {FRAME_OUTPUT_DIR}/{first_frame_name} ***")
 
         # --- ROI extraction ---
         preprocessing_start = time.time()
@@ -1682,7 +1685,8 @@ class EmbryoDetector:
             if ENABLE_DISK_SAVING and hasattr(self, 'save_queue') and self.save_queue is not None:
                 # Use async save queue to avoid blocking camera callback
                 try:
-                    self.save_queue.put_nowait(('frame', os.path.join(FRAME_OUTPUT_DIR, f"embryo_{fc:06d}.png"), dbg))
+                    frame_name = f"embryo_{process_timestamp}_f{fc:06d}.png"
+                    self.save_queue.put_nowait(('frame', os.path.join(FRAME_OUTPUT_DIR, frame_name), dbg))
                 except Exception:
                     # Queue full, skip this save to avoid blocking
                     pass
@@ -1709,7 +1713,8 @@ class EmbryoDetector:
             # Save crop to disk (async via save_queue to avoid blocking camera callback)
             if ENABLE_DISK_SAVING and hasattr(self, 'save_queue') and self.save_queue is not None:
                 try:
-                    self.save_queue.put_nowait(('crop', os.path.join(CROPPED_OUTPUT_DIR, f"embryo_{fc:06d}_{i}.png"), crop))
+                    crop_name = f"embryo_{process_timestamp}_f{fc:06d}_d{i:02d}.png"
+                    self.save_queue.put_nowait(('crop', os.path.join(CROPPED_OUTPUT_DIR, crop_name), crop))
                 except Exception:
                     # Queue full, skip this save to avoid blocking camera callback
                     pass
