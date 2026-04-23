@@ -296,6 +296,10 @@ class EmbryoDetector:
         # Note: Gain uses camera SDK units where 100 = 1x (baseline), 5000 = 50x
         self.exposure_time_us = 9  # microseconds
         self.gain = 5000  # camera-specific gain units (5000 = 50x baseline, minimum is 100)
+
+        # Processing FPS (EMA) for filename tagging / diagnostics
+        self._last_process_wall_s = None
+        self._proc_fps_ema = 0.0
         
         # Legacy ROI parameters (kept for backward compatibility during transition)
         self.roi_start_y = 0
@@ -1267,9 +1271,28 @@ class EmbryoDetector:
 
     def process_frame(self, frame):
         frame_start_time = time.time()
+        now_wall_s = frame_start_time
         self.frame_count += 1
         fc = self.frame_count
         process_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+        # Update processing FPS estimate (EMA)
+        if self._last_process_wall_s is not None:
+            dt = max(1e-6, now_wall_s - self._last_process_wall_s)
+            inst_fps = 1.0 / dt
+            alpha = 0.2
+            if self._proc_fps_ema <= 0.0:
+                self._proc_fps_ema = inst_fps
+            else:
+                self._proc_fps_ema = (1 - alpha) * self._proc_fps_ema + alpha * inst_fps
+        self._last_process_wall_s = now_wall_s
+
+        # Build a filesystem-safe tag: exp/gain/proc-fps at time of processing
+        exp_us = int(getattr(self, "exposure_time_us", 0) or 0)
+        gain = int(getattr(self, "gain", 0) or 0)
+        proc_fps = float(getattr(self, "_proc_fps_ema", 0.0) or 0.0)
+        proc_fps_tag = f"{proc_fps:.1f}".replace(".", "p")
+        capture_tag = f"exp{exp_us}us_gain{gain}_pfps{proc_fps_tag}"
         
         # Store latest frame for on-demand reference capture (Zone 2)
         self._last_frame = frame
@@ -1336,7 +1359,7 @@ class EmbryoDetector:
                        cv2.FONT_HERSHEY_SIMPLEX, 3, (255, 255, 255), 3)
             
             # Save the annotated first frame (async via save_queue to avoid blocking)
-            first_frame_name = f"FIRST_FRAME_WITH_ROI_{process_timestamp}.png"
+            first_frame_name = f"FIRST_FRAME_WITH_ROI_{process_timestamp}_{capture_tag}.png"
             if hasattr(self, 'save_queue') and self.save_queue is not None:
                 try:
                     self.save_queue.put_nowait(('frame', os.path.join(FRAME_OUTPUT_DIR, first_frame_name), first_frame))
@@ -1685,7 +1708,7 @@ class EmbryoDetector:
             if ENABLE_DISK_SAVING and hasattr(self, 'save_queue') and self.save_queue is not None:
                 # Use async save queue to avoid blocking camera callback
                 try:
-                    frame_name = f"embryo_{process_timestamp}_f{fc:06d}.png"
+                    frame_name = f"embryo_{process_timestamp}_{capture_tag}_f{fc:06d}.png"
                     self.save_queue.put_nowait(('frame', os.path.join(FRAME_OUTPUT_DIR, frame_name), dbg))
                 except Exception:
                     # Queue full, skip this save to avoid blocking
@@ -1713,7 +1736,7 @@ class EmbryoDetector:
             # Save crop to disk (async via save_queue to avoid blocking camera callback)
             if ENABLE_DISK_SAVING and hasattr(self, 'save_queue') and self.save_queue is not None:
                 try:
-                    crop_name = f"embryo_{process_timestamp}_f{fc:06d}_d{i:02d}.png"
+                    crop_name = f"embryo_{process_timestamp}_{capture_tag}_f{fc:06d}_d{i:02d}.png"
                     self.save_queue.put_nowait(('crop', os.path.join(CROPPED_OUTPUT_DIR, crop_name), crop))
                 except Exception:
                     # Queue full, skip this save to avoid blocking camera callback
