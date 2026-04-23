@@ -1844,35 +1844,21 @@ class EmbryoDetector:
         # Log Zone 2 detection
         print(f"[ZONE2] Frame {fc}: Something present in zone (diff={diff_pct:.2f}% vs reference)")
         
-        # === TRIGGER DECISION ===
-        # Only trigger if there's an active 'Keep' decision from Zone 1
-        if self._check_zone1_keep_active():
-            # Trigger gating: prevent rapid-fire triggers
-            now = time.time()
-            if now >= self._next_trigger_allowed_time:
-                self._next_trigger_allowed_time = now + self.trigger_cooldown_ms / 1000.0
-                
-                # Calculate detection latency
-                detect_elapsed_ms = (now - frame_start_time) * 1000.0
-                
-                # Trigger Arduino
-                if SERIAL_AVAILABLE and self.ser and getattr(self.ser, 'is_open', False):
-                    self.schedule_arduino_signal(CORRECT_EMBRYO_SIGNAL, detect_elapsed_ms)
-                    self.zone2_trigger_count += 1
-                    
-                    # Consume the 'Keep' decision to prevent double-triggering
-                    self._consume_zone1_keep()
-                    
-                    print(f"[ZONE2 TRIGGER] Frame {fc}: Embryo in trigger zone! "
-                          f"Zone1='Keep' active, Arduino scheduled. "
-                          f"(detect={detect_elapsed_ms:.2f}ms, trigger_count={self.zone2_trigger_count})")
-                else:
-                    print(f"[ZONE2] Frame {fc}: Would trigger but Arduino not available")
-            else:
-                print(f"[ZONE2] Frame {fc}: Detection but in cooldown period")
+        # === TRIGGER DECISION (TEST BRANCH) ===
+        # For piezo testing: trigger EVERY time something is present in Zone 2.
+        # - No Zone 1 gating
+        # - No cooldown
+        now = time.time()
+        detect_elapsed_ms = (now - frame_start_time) * 1000.0
+        if SERIAL_AVAILABLE and self.ser and getattr(self.ser, 'is_open', False):
+            self.schedule_arduino_signal(CORRECT_EMBRYO_SIGNAL, detect_elapsed_ms)
+            self.zone2_trigger_count += 1
+            print(
+                f"[ZONE2 TRIGGER][TEST] Frame {fc}: Zone2 present -> Arduino scheduled "
+                f"(detect={detect_elapsed_ms:.2f}ms, trigger_count={self.zone2_trigger_count})"
+            )
         else:
-            if fc % 60 == 0:  # Log periodically
-                print(f"[ZONE2] Frame {fc}: Motion detected but no active 'Keep' from Zone 1")
+            print(f"[ZONE2][TEST] Frame {fc}: Would trigger but Arduino not available")
 
     # -------------------------- run loop --------------------------
     def _resolve_model_path(self):
