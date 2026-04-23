@@ -150,7 +150,7 @@ def inference_worker(model_path, crop_queue, results_queue, stop_event, device):
                 result = {
                     'frame_index': frame_indices[i],
                     'detection_index': detection_indices[i] if i < len(detection_indices) else 0,
-                    'inference_label': 'Correct',  # TEMP: force all embryos as Correct (was: class_names[pred_idx])
+                    'inference_label': class_names[pred_idx],
                     'inference_time': inference_time / len(images),  # Average time per image
                     'speed': speeds[i] if i < len(speeds) else None,
                     'object_id': obj_ids[i] if i < len(obj_ids) else None
