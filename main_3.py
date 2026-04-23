@@ -80,7 +80,10 @@ def save_worker(save_queue, stop_event):
             print(f"Save worker error: {e}")
 
 def inference_worker(model_path, crop_queue, results_queue, stop_event, device):
-    class_names = ['Incorrect', 'Correct']
+    # NOTE:
+    # If your training used ImageFolder with class_to_idx {'Correct': 0, 'Incorrect': 1},
+    # mapping must be [Correct, Incorrect] at inference time.
+    class_names = ['Correct', 'Incorrect']
     infer_transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
@@ -90,6 +93,7 @@ def inference_worker(model_path, crop_queue, results_queue, stop_event, device):
     # Load model with error handling
     try:
         print(f"[INFERENCE] Loading model from: {model_path}")
+        print(f"[INFERENCE] Label mapping: 0->{class_names[0]}, 1->{class_names[1]}")
         if not os.path.exists(model_path):
             print(f"[INFERENCE] ERROR: Model file not found at {model_path}")
             return
@@ -107,6 +111,7 @@ def inference_worker(model_path, crop_queue, results_queue, stop_event, device):
         return
     
     inference_count = 0
+    class_count = {"Incorrect": 0, "Correct": 0}
 
     while not stop_event.is_set():
         try:
@@ -147,20 +152,26 @@ def inference_worker(model_path, crop_queue, results_queue, stop_event, device):
 
             for i in range(len(images)):
                 pred_idx = int(preds[i].item())
+                pred_label = class_names[pred_idx]
                 result = {
                     'frame_index': frame_indices[i],
                     'detection_index': detection_indices[i] if i < len(detection_indices) else 0,
-                    'inference_label': class_names[pred_idx],
+                    'inference_label': pred_label,
                     'inference_time': inference_time / len(images),  # Average time per image
                     'speed': speeds[i] if i < len(speeds) else None,
                     'object_id': obj_ids[i] if i < len(obj_ids) else None
                 }
                 results_queue.put(result)
                 inference_count += 1
+                if pred_label in class_count:
+                    class_count[pred_label] += 1
                 
             # Log progress periodically
-            if inference_count % 10 == 0:
-                print(f"[INFERENCE] Processed {inference_count} classifications")
+            if inference_count % 20 == 0:
+                print(
+                    f"[INFERENCE] Processed {inference_count} classifications "
+                    f"(Incorrect={class_count['Incorrect']}, Correct={class_count['Correct']})"
+                )
                 
         except Empty:
             continue
@@ -184,6 +195,9 @@ class EmbryoDetector:
         # --- Trigger cooldown (only one trigger per window) ---
         self.trigger_cooldown_ms = 500  # only one trigger every 500ms
         self._next_trigger_allowed_time = 0.0  # epoch seconds
+        
+        # Preferred model path (can be set by caller/GUI)
+        self.model_path = None
 
         # --- DUAL-ZONE DETECTION SYSTEM ---
         # Zone 1 (Left): Full ML classification - determines if embryo is "Keep" or "Discard"
@@ -1861,6 +1875,20 @@ class EmbryoDetector:
                 print(f"[ZONE2] Frame {fc}: Motion detected but no active 'Keep' from Zone 1")
 
     # -------------------------- run loop --------------------------
+    def _resolve_model_path(self):
+        """Resolve model path with preferred override and sensible defaults."""
+        candidate_paths = []
+        if self.model_path:
+            candidate_paths.append(self.model_path)
+        # Prefer explicitly newer model if present
+        candidate_paths.append(os.path.join(_project_dir, "new_resnet18_model(0.34).pth"))
+        candidate_paths.append(os.path.join(_project_dir, "resnet18_model.pth"))
+        
+        for path in candidate_paths:
+            if path and os.path.exists(path):
+                return path
+        return candidate_paths[-1]
+
     def run(self, video_path: Optional[str] = None, show_window: bool = False):
         self.show_window = show_window
         cap: Optional[cv2.VideoCapture] = None
@@ -1913,8 +1941,8 @@ class EmbryoDetector:
                 self.ser = None
 
         print(f"Main process using device: {self.device}")
-        # Use absolute path for model to ensure it works when GUI changes working directory
-        model_path = os.path.join(_project_dir, "resnet18_model.pth")
+        model_path = self._resolve_model_path()
+        print(f"[INFERENCE] Selected model path: {model_path}")
         if not os.path.exists(model_path):
             print(f"WARNING: Model file not found at {model_path}")
         inference_process = Process(target=inference_worker, args=(model_path, self.crop_queue, self.results_queue, self.stop_event, self.device))
